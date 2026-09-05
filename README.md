@@ -54,8 +54,10 @@ Summary of the changes:
   so rebuilding it is optional.
 - `tests/` - round-trip verification, a wire-format guard, and a compile check
   for the node against a mock DDImage.
-- `tools/build_and_install.bat` - one-step build and install from source, since
-  this repository ships no compiled DLLs.
+- `install/install.bat` - rewritten so a Release ZIP installs with no compiler,
+  and so it removes any previous install (upstream's included) without touching
+  the NVIDIA runtime you supplied.
+- `tools/build_and_install.bat` - one-step build and install from source.
 
 Colour management is **on by default**. Set **Enable Color Management** off to get
 upstream behaviour back, bit for bit.
@@ -102,8 +104,44 @@ DLL built for Nuke 15.0 is automatically compatible with Nuke 15.1 or 15.2.
 
 ## Installation
 
-This fork ships source, not compiled DLLs, so installing means building first.
-`tools\build_and_install.bat` does both in one step:
+Two paths. Pick the first unless you are changing the code.
+
+### A. From a Release ZIP — no compiler needed
+
+1. Download the Release ZIP and extract it.
+2. Run `install.bat`.
+3. Restart Nuke, press **Tab**, create `DLSS5Live`.
+
+No Visual Studio, no CMake, no Nuke NDK — it only copies prebuilt files.
+
+`install.bat` removes any previous installation before installing, including one
+made by upstream's installer:
+
+- old `DLSS5Live.dll` files, for every Nuke version, so no stale build can be
+  loaded by accident;
+- a stray DLL in `~/.nuke/` or `~/.nuke/DLSS5Live/`, which would shadow the
+  versioned one and load the wrong ABI into Nuke;
+- upstream's `init.py` registration, replaced with an equivalent one that has
+  an end marker so `/uninstall` can remove it cleanly later.
+
+**Your NVIDIA runtime is never touched.** Only the two files this project owns
+(`DLSS_Nuke_Worker.exe` and the `nvngx.dll` shim) are replaced under `runtime/`;
+anything else you put there stays. Your `~/.nuke/init.py` is backed up with a
+timestamp before any edit, and only one clearly-marked block is ever added or
+removed.
+
+| Option | Effect |
+| --- | --- |
+| `/keep-versions` | Keep DLLs for Nuke versions this package does not ship. By default they are removed, and the installer tells you which ones before doing it. |
+| `/uninstall` | Remove the plug-in and the `init.py` registration. |
+| `/y` | Do not wait for a keypress at the end. |
+
+### B. From source
+
+Needs **Visual Studio 2022 or newer with "Desktop development with C++"** (CMake
+and Ninja come with its "C++ CMake tools for Windows" component) and at least one
+**Nuke install**, because the plug-in links against `DDImage` from the NDK — and
+the NDK ships inside Nuke, not as a separate download.
 
 ```bat
 git clone https://github.com/guidogonzalezc/DLSS5-for-Nuke-ACES.git
@@ -111,11 +149,10 @@ cd DLSS5-for-Nuke-ACES
 tools\build_and_install.bat
 ```
 
-It finds Visual Studio, CMake and Ninja, finds every Nuke install that carries
-an NDK, verifies the colour pipeline, compiles `DLSS5Live.dll` for each Nuke
-major version it found, compiles the worker, and installs everything into
-`~/.nuke/DLSS5Live/` — the same layout upstream's `install/install.bat` produces,
-so the two are interchangeable.
+It finds the toolchain, finds every Nuke install carrying an NDK, verifies the
+colour pipeline, compiles `DLSS5Live.dll` for each Nuke major version found,
+compiles the worker, and installs into `~/.nuke/DLSS5Live/`. Any Nuke version is
+handled, not just the two upstream publishes.
 
 | Option | Effect |
 | --- | --- |
@@ -123,36 +160,28 @@ so the two are interchangeable.
 | `/skip-tests` | Skip the colour pipeline verification. |
 | `/skip-worker` | Do not build `DLSS_Nuke_Worker.exe` and the caller shim. |
 | `/build-only` | Compile into `bin\` without installing. |
-| `/uninstall` | Remove `~/.nuke/DLSS5Live` and the `init.py` registration. |
-
-You need **Visual Studio 2022 or newer with "Desktop development with C++"**
-(CMake and Ninja come with its "C++ CMake tools for Windows" component) and at
-least one **Nuke install**, because the plug-in links against `DDImage` from the
-NDK. A DLL built for one Nuke major version will not load in another; the script
-handles any version it finds, not just the two upstream publishes.
-
-Re-running is safe. Your own `~/.nuke/init.py` is backed up with a timestamp
-before a single clearly-marked block is appended, and running again detects that
-block instead of stacking a second one.
+| `/uninstall` | Same as the installer's. |
 
 ### Then supply the NVIDIA runtime
 
-The build produces everything this project owns. It does **not** produce, ship or
-download NVIDIA binaries. Put your own legally obtained copies into
-`~/.nuke/DLSS5Live/runtime/`:
+Neither path produces, ships or downloads NVIDIA binaries. Put your own legally
+obtained copies into `~/.nuke/DLSS5Live/runtime/`:
 
 | File | Where it comes from |
 | --- | --- |
-| `_nvngx.dll` | NVIDIA NGX core. **You supply this.** Note the leading underscore. |
+| `_nvngx.dll` | NGX core. **You supply this.** Note the leading underscore. |
 | `nvngx_dlssnr.dll` | DLSS-NR model. **You supply this.** |
-| `nvngx.dll` | This project's caller shim. **Built for you** — do not overwrite it with NVIDIA's file. |
-| `DLSS_Nuke_Worker.exe` | This project's worker. **Built for you.** |
+| `nvngx.dll` | This project's caller shim. **Installed for you** — a different file from NVIDIA's `_nvngx.dll`; do not overwrite it. |
+| `DLSS_Nuke_Worker.exe` | This project's worker. **Installed for you.** |
+
+The installer prints which of these are present and which are missing when it
+finishes.
 
 ### First run
 
 1. Start Nuke, press **Tab**, create `DLSS5Live`.
-2. The node header should read **v1.1.0-aces**. If it still says `v1.0.0`, an
-   older DLL is being picked up from somewhere else on the plug-in path.
+2. The node header should read **v1.1.0-aces**. If it says `v1.0.0`, an older DLL
+   is still being picked up from elsewhere on the plug-in path.
 3. Set **nvngx.dll (Worker) Path** to
    `~/.nuke/DLSS5Live/runtime/DLSS_Nuke_Worker.exe` (or set the
    `NUKE_DLSS5_WORKER_PATH` environment variable).
@@ -164,10 +193,18 @@ To sanity-check colour: set **Upscaling Mode** to `1.0x (DLAA)` and `Merge
 difference only — no overall cast, no shift along a grey ramp. Toggling **Enable
 Color Management** shows the upstream behaviour for comparison.
 
-### Installing a prebuilt Release instead
+### Producing a Release ZIP (maintainers)
 
-`install/install.bat` is upstream's installer and still works unchanged for a
-Release ZIP that already contains compiled DLLs.
+The ZIP that path A installs has to be built once, on a machine with Nuke:
+
+```powershell
+tools\build_and_install.bat /build-only
+powershell.exe -ExecutionPolicy Bypass -File tools\package_release.ps1 -CreateZip
+```
+
+`package_release.ps1` collects every `bin\Nuke*` DLL that was built, the worker,
+the installer and the docs, stamps `VERSION.txt` to match the string compiled
+into the node header, and refuses to package third-party runtime binaries.
 
 ## Runtime policy
 
@@ -314,9 +351,8 @@ into Nuke's row cache, eliminating vertical flip and orientation issues.
 
 ## Build from source
 
-`tools\build_and_install.bat` (see [Installation](#installation)) is the easy
-path and covers most cases. The underlying scripts are still there when you need
-finer control.
+[Installation](#installation) covers the normal path. What follows is for
+driving the underlying scripts directly.
 
 Building requires Visual Studio 2022 with Desktop development with C++, CMake,
 Ninja, and a local Nuke NDK installation matching the target DLL. Build the

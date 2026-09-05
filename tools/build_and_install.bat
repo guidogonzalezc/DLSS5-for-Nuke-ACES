@@ -227,7 +227,7 @@ if exist "%REPO%\bin\worker\DLSS_Nuke_Worker.exe" (
 REM Register the plug-in search path. Delegated to a PowerShell script rather
 REM than inlined here: the block contains quotes, parentheses and regex
 REM metacharacters that cmd's escaping rules mangle.
-powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%REPO%\tools\register_plugin_path.ps1" -Action install -InitFile "%INIT_FILE%"
+powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%REPO%\install\register_plugin_path.ps1" -Action install -InitFile "%INIT_FILE%"
 if errorlevel 1 (
     echo.
     echo [ERROR] Could not register the plug-in path in %INIT_FILE%.
@@ -485,7 +485,7 @@ if exist "%PLUGIN_DIR%" (
     echo   [*] %PLUGIN_DIR% was not present
 )
 
-powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%REPO%\tools\register_plugin_path.ps1" -Action uninstall -InitFile "%INIT_FILE%" -Indent "  "
+powershell.exe -ExecutionPolicy Bypass -NoProfile -File "%REPO%\install\register_plugin_path.ps1" -Action uninstall -InitFile "%INIT_FILE%" -Indent "  "
 
 echo.
 echo Done. Your own init.py content was preserved.

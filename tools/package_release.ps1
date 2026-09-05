@@ -1,118 +1,156 @@
 <#
 .SYNOPSIS
-    Packages DLSS5-for-Nuke release folder and generates GitHub Release ZIP.
+    Assembles the Release folder and ZIP that end users install with install.bat.
+
+.DESCRIPTION
+    This is the maintainer-side half of the "no compiler needed" install path:
+    run it once on a machine that has Nuke, and everyone else installs the
+    resulting ZIP with no Visual Studio, no CMake and no Nuke NDK.
+
+    Only project-authored files go in. Upstream's version of this script also
+    reached for nvngx_dlss.dll, nvngx_dlssnr.dll, dxgi.dll, ReShade.ini and the
+    RenoDX addon if they happened to be on the maintainer's machine, which
+    contradicts the repository's own runtime policy and would have shipped
+    third-party binaries inside a public Release. Those are refused here, and
+    the script says so when it finds them.
+
+.EXAMPLE
+    tools\build_and_install.ps1            # build first
+    tools\package_release.ps1 -CreateZip
 #>
 param(
     [string]$OutputDir = "$PSScriptRoot\..\dist\DLSS5_Nuke",
-    [switch]$CreateZip = $false
+    [switch]$CreateZip = $false,
+    [switch]$AllowMissingWorker = $false
 )
 
 $ErrorActionPreference = "Stop"
-$projectRoot = Resolve-Path "$PSScriptRoot\.."
+$projectRoot = (Resolve-Path "$PSScriptRoot\..").Path
 
 Write-Host "===================================================" -ForegroundColor Cyan
-Write-Host "  DLSS 5 for Nuke - Release Packaging Tool        " -ForegroundColor Cyan
+Write-Host "  DLSS 5 for Nuke (ACES fork) - Release Packaging  " -ForegroundColor Cyan
 Write-Host "===================================================" -ForegroundColor Cyan
 
-# 1. Prepare clean output directory
-if (Test-Path $OutputDir) {
-    Remove-Item $OutputDir -Recurse -Force
+# ---- version ---------------------------------------------------------------
+$version = "0.0.0"
+$cmakePath = Join-Path $projectRoot "CMakeLists.txt"
+if (Test-Path $cmakePath) {
+    $c = Get-Content $cmakePath -Raw
+    if ($c -match 'project\s*\(\s*DLSS5Live\s+VERSION\s+([0-9\.]+)') { $version = $matches[1] }
 }
+# Match the string compiled into the node header, so "which build is this?" has
+# one answer everywhere: the ZIP name, VERSION.txt and the node's own title.
+$versionLabel = "v$version-aces"
+Write-Host "`n[*] Version: $versionLabel" -ForegroundColor Yellow
+
+# ---- clean output ----------------------------------------------------------
+if (Test-Path $OutputDir) { Remove-Item $OutputDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
-New-Item -ItemType Directory -Force -Path "$OutputDir\bin\Nuke15" | Out-Null
-New-Item -ItemType Directory -Force -Path "$OutputDir\bin\Nuke17" | Out-Null
 New-Item -ItemType Directory -Force -Path "$OutputDir\runtime" | Out-Null
 
-# 2. Copy Plugin DLLs
+# ---- plug-in DLLs ----------------------------------------------------------
+# Every bin\Nuke<major> that carries a DLL, rather than a hardcoded 15 and 17,
+# so a Release can cover whatever versions were actually built.
 $binDir = Join-Path $projectRoot "bin"
-$dllFound = $false
+$majors = @()
 
-foreach ($nukeVer in @("Nuke15", "Nuke17")) {
-    $buildDir = if ($nukeVer -eq "Nuke15") { "build_nuke15" } else { "build_nuke17" }
-    $builtDll = Join-Path $projectRoot "$buildDir\DLSS5Live.dll"
-    $srcDll = if (Test-Path $builtDll) { $builtDll } else { "$binDir\$nukeVer\DLSS5Live.dll" }
-    if (Test-Path $srcDll) {
-        Copy-Item $srcDll "$OutputDir\bin\$nukeVer\DLSS5Live.dll" -Force
-        if (-not $dllFound) {
-            Copy-Item $srcDll "$OutputDir\DLSS5Live.dll" -Force
-        }
-        Write-Host "[+] Copied $nukeVer DLL (DLSS5Live.dll)" -ForegroundColor Green
-        $dllFound = $true
+if (Test-Path $binDir) {
+    foreach ($d in Get-ChildItem $binDir -Directory -Filter "Nuke*") {
+        $dll = Join-Path $d.FullName "DLSS5Live.dll"
+        if (-not (Test-Path $dll)) { continue }
+        New-Item -ItemType Directory -Force -Path "$OutputDir\bin\$($d.Name)" | Out-Null
+        Copy-Item $dll "$OutputDir\bin\$($d.Name)\DLSS5Live.dll" -Force
+        $majors += $d.Name
+        $size = [math]::Round((Get-Item $dll).Length / 1KB)
+        Write-Host "    [+] bin\$($d.Name)\DLSS5Live.dll  ($size KB)" -ForegroundColor Green
     }
 }
 
-# 3. Copy Install Scripts & Documentation
-Copy-Item "$projectRoot\install\install.bat" "$OutputDir\install.bat" -Force
-Copy-Item "$projectRoot\install\menu.py" "$OutputDir\menu.py" -Force
-if (Test-Path "$projectRoot\install\init.py") {
-    Copy-Item "$projectRoot\install\init.py" "$OutputDir\init.py" -Force
-}
-if (Test-Path "$projectRoot\install\DLSS5.png") {
-    Copy-Item "$projectRoot\install\DLSS5.png" "$OutputDir\DLSS5.png" -Force
-}
-if (Test-Path "$projectRoot\README.md") {
-    Copy-Item "$projectRoot\README.md" "$OutputDir\README.md" -Force
-}
-Write-Host "[+] Copied install.bat, menu.py, init.py, DLSS5.png, README.md" -ForegroundColor Green
+if ($majors.Count -eq 0) {
+    Write-Error @"
+No plug-in DLLs found under $binDir.
 
-# 4. Copy Runtime Dependencies
-$runtimeCandidates = @(
-    "$env:DLSS5_RUNTIME_DIR",
-    "$projectRoot\worker\build",
-    "$projectRoot\runtime",
-    "$projectRoot\package\runtime",
-    "$env:USERPROFILE\.nuke\DLSS5Live\runtime",
-    "$PSScriptRoot\..\..\DLSS5\package\runtime"
-)
+A Release ZIP exists so that users without a compiler can install, which means
+the DLLs have to be built here first, on a machine that has Nuke:
 
-$runtimeFiles = @(
-    "DLSS_Nuke_Worker.exe",
-    "nvngx.dll",
-    "nvngx_dlss.dll",
-    "nvngx_dlssnr.dll",
-    "dxgi.dll",
-    "renodx-dlss5.addon64",
-    "ReShade.ini"
-)
+    tools\build_and_install.bat /build-only
 
-foreach ($file in $runtimeFiles) {
-    $copied = $false
-    foreach ($candidate in $runtimeCandidates) {
-        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-        $sourcePath = Join-Path $candidate $file
-        if (Test-Path $sourcePath) {
-            Copy-Item $sourcePath "$OutputDir\runtime\$file" -Force
-            Write-Host "    [+] Runtime: $file" -ForegroundColor Gray
-            $copied = $true
-            break
-        }
-    }
-    if (-not $copied) {
-        Write-Warning "Could not find runtime file: $file"
+Building requires a Nuke installation: the plug-in links against DDImage from
+its NDK, and the NDK ships inside Nuke rather than as a separate download.
+"@
+    exit 1
+}
+
+# ---- worker ----------------------------------------------------------------
+$workerDir = Join-Path $projectRoot "bin\worker"
+$workerOk = $true
+foreach ($f in @("DLSS_Nuke_Worker.exe", "nvngx.dll")) {
+    $src = Join-Path $workerDir $f
+    if (Test-Path $src) {
+        Copy-Item $src "$OutputDir\runtime\$f" -Force
+        Write-Host "    [+] runtime\$f" -ForegroundColor Green
+    } else {
+        $workerOk = $false
+        Write-Warning "Missing $f - build it with tools\build_and_install.bat"
     }
 }
+if (-not $workerOk -and -not $AllowMissingWorker) {
+    Write-Error "The worker is missing. Build it, or pass -AllowMissingWorker on purpose."
+    exit 1
+}
 
-Write-Host "`n[SUCCESS] Package assembled at: $OutputDir" -ForegroundColor Green
+# ---- installer and docs ----------------------------------------------------
+$flat = @{
+    "install\install.bat"             = "install.bat"
+    "install\register_plugin_path.ps1" = "register_plugin_path.ps1"
+    "install\init.py"                 = "init.py"
+    "install\menu.py"                 = "menu.py"
+    "install\DLSS5.png"               = "DLSS5.png"
+    "README.md"                       = "README.md"
+    "docs\ACES.md"                    = "ACES.md"
+    "LICENSE"                         = "LICENSE"
+}
+foreach ($k in $flat.Keys) {
+    $src = Join-Path $projectRoot $k
+    if (Test-Path $src) {
+        Copy-Item $src (Join-Path $OutputDir $flat[$k]) -Force
+    } elseif ($k -like "install\*") {
+        Write-Error "Required file missing from the package: $k"
+        exit 1
+    }
+}
+Write-Host "    [+] install.bat, register_plugin_path.ps1, init.py, menu.py, icon, docs" -ForegroundColor Green
 
-# 5. Optional Zip Creation
+# install.bat reads this to report what it is installing, and writes a copy into
+# the install directory so the next run can say what it is replacing.
+Set-Content -Path "$OutputDir\VERSION.txt" -Value $versionLabel
+
+# ---- runtime policy check --------------------------------------------------
+# A stray NVIDIA or ReShade binary in the tree must never reach a public ZIP.
+$forbidden = @("_nvngx.dll", "nvngx_dlss.dll", "nvngx_dlssnr.dll", "dxgi.dll",
+               "renodx-dlss5.addon64", "ReShade.ini", "ReShade64.dll")
+$leaked = Get-ChildItem $OutputDir -Recurse -File |
+          Where-Object { $forbidden -contains $_.Name }
+if ($leaked) {
+    Write-Host ""
+    foreach ($f in $leaked) { Write-Warning "Third-party runtime file in the package: $($f.FullName)" }
+    Write-Error "Refusing to package third-party runtime binaries. Remove them and re-run."
+    exit 1
+}
+Write-Host "    [+] runtime policy check passed (no third-party binaries)" -ForegroundColor Green
+
+Write-Host "`n[SUCCESS] Package assembled: $OutputDir" -ForegroundColor Green
+Write-Host "          Nuke versions: $($majors -join ', ')" -ForegroundColor Gray
+
+# ---- zip -------------------------------------------------------------------
 if ($CreateZip) {
-    # Extract version from CMakeLists.txt
-    $cmakePath = Join-Path $projectRoot "CMakeLists.txt"
-    $version = "1.0.0"
-    if (Test-Path $cmakePath) {
-        $cmakeContent = Get-Content $cmakePath -Raw
-        if ($cmakeContent -match 'project\s*\(\s*DLSS5Live\s+VERSION\s+([0-9\.]+)') {
-            $version = $matches[1]
-        }
-    }
-
     $distParent = Split-Path -Parent $OutputDir
-    $zipPath = Join-Path $distParent "DLSS5-for-Nuke-v$version.zip"
+    $zipPath = Join-Path $distParent "DLSS5-for-Nuke-ACES-$versionLabel.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-    Write-Host "[*] Creating Release ZIP (v$version): $zipPath ..." -ForegroundColor Yellow
     Compress-Archive -Path "$OutputDir\*" -DestinationPath $zipPath -Force
-    Write-Host "[SUCCESS] Release ZIP created!" -ForegroundColor Green
-    Write-Host "  ZIP: $zipPath" -ForegroundColor Cyan
+    $mb = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+    Write-Host "`n[SUCCESS] Release ZIP: $zipPath ($mb MB)" -ForegroundColor Green
+    Write-Host "          Users extract it and run install.bat. No compiler needed." -ForegroundColor Gray
 }
 
 Write-Host "===================================================" -ForegroundColor Cyan
