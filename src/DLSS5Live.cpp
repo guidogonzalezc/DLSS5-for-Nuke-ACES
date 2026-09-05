@@ -16,6 +16,33 @@ static const char* const nr_styles[]     = { "Default", "Natural", "Cinematic", 
 static const char* const nr_presets[]    = { "Default", "Preset #1", "Preset #2", "Preset #3", 0 };
 static const char* const image_transports[] = { "16-bit Half Float (Scene-Linear)", "8-bit Integer (SDR Legacy)", 0 };
 
+// Order must match aces::WorkingSpace / aces::Encoding / aces::ToneMap.
+static const char* const aces_working_spaces[] = {
+    "ACEScg (AP1 scene-linear)",
+    "ACES2065-1 (AP0 scene-linear)",
+    "ACEScct",
+    "ACEScc",
+    "Linear Rec.709 / sRGB",
+    "Linear P3-D65",
+    0
+};
+
+static const char* const aces_encodings[] = {
+    "sRGB Display (Rec.709) - Recommended",
+    "Rec.709 Camera OETF",
+    "Gamma 2.2 (Rec.709)",
+    "ACEScct Log (AP1, highlight-safe)",
+    "Linear (no encoding)",
+    0
+};
+
+static const char* const aces_tonemaps[] = {
+    "Extended Reinhard (Recommended)",
+    "ACES Filmic (Narkowicz)",
+    "None (Clip above white)",
+    0
+};
+
 static Iop* build(Node* node) { return new DLSS5Live(node); }
 const Iop::Description DLSS5Live::description("DLSS5Live", "Filter/DLSS5Live", build);
 
@@ -174,6 +201,19 @@ DLSS5Live::DLSS5Live(Node* node) : Iop(node) {
     k_local_structure = 1.0f;
     k_skin_structure  = -1.0f;
     k_hdr_range_scale = 2.0f;
+
+    // ACES on by default: this fork exists because the raw scene-linear path
+    // wrecks colour, so the corrected path is the one users should land on.
+    k_aces_enabled        = true;
+    k_aces_working_space  = aces::WS_ACESCG;
+    k_aces_encoding       = aces::ENC_SRGB;
+    k_aces_tonemap        = aces::TM_REINHARD;
+    k_aces_exposure       = 0.0f;
+    k_aces_auto_white     = true;
+    k_aces_white_point    = 16.0f;
+    k_aces_gamut_compress = true;
+    m_seq_white_point     = 0.0f;
+
     k_nvngx_path      = get_default_worker_path();
     m_last_hash       = 0;
     m_in_w            = 0;
@@ -242,6 +282,67 @@ void DLSS5Live::knobs(Knob_Callback f) {
     SetRange(f, -5.0, 5.0);
     Bool_knob(f, &k_invert_mv_x, "invert_mv_x", "Invert X");
     Bool_knob(f, &k_invert_mv_y, "invert_mv_y", "Invert Y");
+
+    Divider(f, "ACES Color Management");
+
+    Bool_knob(f, &k_aces_enabled, "aces_enabled", "Enable Color Management");
+    Tooltip(f, "Wrap the neural pass in an invertible colour transform.\n"
+               "The DLSS models are trained on display-referred Rec.709/sRGB imagery in a 0-1 range. "
+               "Nuke's ACES working space is scene-linear with AP1 primaries and no upper bound, so sending it "
+               "straight through shifts hue, desaturates and crushes highlights.\n"
+               "With this on, the image is converted to what the model expects, and the exact inverse is applied "
+               "to the result: DLSS still does the upscaling and reconstruction, but the colour comes back where "
+               "it started.\n"
+               "Turn it off only to reproduce the upstream (non-ACES) behaviour.");
+
+    Enumeration_knob(f, &k_aces_working_space, aces_working_spaces, "aces_working_space", "Working Space");
+    Tooltip(f, "The colour space of the pixels arriving at input 0. This must match your Nuke working space "
+               "(Project Settings > Color > working space).\n"
+               "With an OCIO ACES config this is normally ACEScg. Set it wrong and the node will apply the wrong "
+               "primaries, which is exactly the hue shift this option exists to prevent.");
+
+    Enumeration_knob(f, &k_aces_encoding, aces_encodings, "aces_encoding", "DLSS Encoding");
+    Tooltip(f, "What the neural model is shown.\n"
+               "- sRGB Display (Rec.709): converts to Rec.709 primaries and applies the sRGB curve. Closest to the "
+               "model's training data, so it gives the best reconstruction. Recommended.\n"
+               "- Rec.709 Camera OETF / Gamma 2.2: same idea with a different curve, for matching a specific pipeline.\n"
+               "- ACEScct Log: keeps AP1 primaries and log-encodes instead. The model sees less familiar colour, but "
+               "precision is even across the whole range, so extreme highlights survive intact. Use it for fire, "
+               "explosions and practicals above ~30.\n"
+               "- Linear: no encoding at all. Reproduces the upstream behaviour.");
+
+    Enumeration_knob(f, &k_aces_tonemap, aces_tonemaps, "aces_tonemap", "Highlight Roll-off");
+    Tooltip(f, "How scene values above the white point are folded into the 0-1 range the model expects.\n"
+               "- Extended Reinhard: gentle, strictly monotonic, invertible for any value. Recommended.\n"
+               "- ACES Filmic: the Narkowicz ACES curve, scaled so the white point lands at the top of its "
+               "invertible range. More contrast in the mids.\n"
+               "- None: no roll-off. Everything above 1.0 is left for the model to clip.\n"
+               "Ignored for the ACEScct Log encoding, which carries the range on its own.");
+
+    Float_knob(f, &k_aces_exposure, "aces_exposure", "Pre-Exposure");
+    SetRange(f, -6.0, 6.0);
+    Tooltip(f, "Exposure in stops applied before the neural pass and removed after it.\n"
+               "Purely a way to place the image where the model works best; it never reaches the output. "
+               "Raise it for very dark plates so the reconstruction has something to grip.");
+
+    Bool_knob(f, &k_aces_auto_white, "aces_auto_white", "Auto White Point");
+    Tooltip(f, "Derive the white point from the brightest pixel in the frame, so nothing clips into the roll-off.\n"
+               "In Sequence and CG Multi-pass the value is latched when temporal history resets and held for the "
+               "rest of the run: recomputing it per frame would make the model see a different exposure every "
+               "frame, which reads as flicker in the accumulated history.");
+
+    Float_knob(f, &k_aces_white_point, "aces_white_point", "White Point");
+    SetRange(f, 1.0, 128.0);
+    Tooltip(f, "The scene-linear value that maps to 1.0 for the model.\n"
+               "Set it just above your brightest highlight. Higher values protect more highlight range but spend "
+               "fp16 precision doing it: at 16 the round trip is accurate to ~0.8% of pixel magnitude, at 128 to "
+               "~4%. If you need both extreme highlights and precision, use the ACEScct Log encoding instead.");
+
+    Bool_knob(f, &k_aces_gamut_compress, "aces_gamut_compress", "Gamut Compress");
+    Tooltip(f, "Apply the ACES reference gamut compression, and undo it afterwards.\n"
+               "Saturated AP1 colours land outside Rec.709 and come out as negative components, which neural "
+               "models handle badly. This folds them just inside the cube for the neural pass and unfolds them "
+               "on the way back.");
 
     Divider(f, "Color & Dynamic Range");
 
@@ -330,9 +431,23 @@ void DLSS5Live::update_ui_visibility() {
     set_vis(knob("invert_mv_x"), is_ext);
     set_vis(knob("invert_mv_y"), is_ext);
 
+    // ACES knobs
+    const bool aces_on   = k_aces_enabled;
+    const bool is_log    = (k_aces_encoding == aces::ENC_ACESCCT);
+    const bool has_curve = aces_on && !is_log;
+    set_vis(knob("aces_working_space"),  aces_on);
+    set_vis(knob("aces_encoding"),       aces_on);
+    set_vis(knob("aces_tonemap"),        has_curve);
+    set_vis(knob("aces_exposure"),       aces_on);
+    set_vis(knob("aces_auto_white"),     has_curve && k_aces_tonemap != aces::TM_NONE);
+    set_vis(knob("aces_white_point"),    has_curve && k_aces_tonemap != aces::TM_NONE && !k_aces_auto_white);
+    set_vis(knob("aces_gamut_compress"), aces_on && !is_log);
+
+    // HDR Range Scale is the upstream stopgap for the same problem the colour
+    // pipeline now solves properly, so it only applies in legacy mode.
     bool is_16bit = (k_image_transport == 0);
-    set_vis(knob("enable_hdr_range"), is_16bit);
-    set_vis(knob("hdr_range_scale"), is_16bit && k_enable_hdr_range);
+    set_vis(knob("enable_hdr_range"), is_16bit && !aces_on);
+    set_vis(knob("hdr_range_scale"), is_16bit && !aces_on && k_enable_hdr_range);
 }
 
 int DLSS5Live::knob_changed(Knob* k) {
@@ -343,7 +458,21 @@ int DLSS5Live::knob_changed(Knob* k) {
         k->is("dis_preset") ||
         k->is("color_bit_depth") ||
         k->is("image_transport") ||
-        k->is("enable_hdr_range")) {
+        k->is("enable_hdr_range") ||
+        k->is("aces_working_space") ||
+        k->is("aces_tonemap") ||
+        k->is("aces_exposure") ||
+        k->is("aces_auto_white") ||
+        k->is("aces_white_point") ||
+        k->is("aces_gamut_compress")) {
+        // Purely pixel-side settings: _validate() already drops the frame cache,
+        // and none of them change the worker's setup, so do not force a restart.
+        update_ui_visibility();
+        return 1;
+    }
+    if (k->is("aces_enabled") || k->is("aces_encoding")) {
+        // These two can flip the display-referred flag sent to the worker, so
+        // let the settings hash decide whether a rebuild is actually needed.
         update_ui_visibility();
         return 1;
     }
@@ -375,6 +504,20 @@ uint32_t DLSS5Live::getPerfQuality() const {
         case 4: return 3; // Ultra Performance (3.0x)
         default: return 5;
     }
+}
+
+aces::Params DLSS5Live::buildColorParams() const {
+    aces::Params p;
+    p.enabled        = k_aces_enabled;
+    p.working_space  = k_aces_working_space;
+    p.encoding       = k_aces_encoding;
+    p.tonemap        = k_aces_tonemap;
+    p.exposure_stops = k_aces_exposure;
+    p.white_point    = std::max(k_aces_white_point, 1.0f);
+    // Gamut compression only makes sense when the primaries actually change;
+    // the ACEScct path stays in AP1, where nothing is out of gamut.
+    p.gamut_compress = k_aces_gamut_compress && (k_aces_encoding != aces::ENC_ACESCCT);
+    return p;
 }
 
 uint32_t DLSS5Live::getModelPreset() const {
@@ -410,6 +553,11 @@ size_t DLSS5Live::computeSettingsHash() const {
     std::memcpy(&ibits, &k_skin_structure, 4);  h ^= (size_t)ibits * 800021u;
     h ^= (size_t)(k_enable_hdr_range ? 1 : 0) * 820023u;
     std::memcpy(&ibits, &k_hdr_range_scale, 4); h ^= (size_t)ibits * 850019u;
+
+    // Only the settings that reach the worker header belong in this hash; the
+    // remaining colour knobs are applied when packing pixels and need no restart.
+    h ^= (size_t)(k_aces_enabled ? 1 : 0) * 860011u;
+    h ^= (size_t)(k_aces_encoding + 1) * 870007u;
     std::memcpy(&ibits, &k_mv_scale_x, 4);      h ^= (size_t)ibits * 900037u;
     std::memcpy(&ibits, &k_mv_scale_y, 4);      h ^= (size_t)ibits * 900053u;
     h ^= (size_t)(k_invert_mv_x ? 1 : 0) * 950009u;
@@ -497,7 +645,10 @@ void DLSS5Live::rebuildWorker() {
             header.dis_iterations = (uint32_t)(k_dis_iterations > 0 ? k_dis_iterations : 25);
             break;
     }
-    header._reserved_scene_cut = 0;
+    // Let the worker know whether the pixels it receives are already
+    // display-referred, so it can drop the NGX IsHDR flag for the SR pass.
+    header.color_flags = aces::Transform(buildColorParams()).producesDisplayReferred()
+                       ? COLOR_DISPLAY_REFERRED : 0u;
     header._reserved_thresh = 0.0f;
 
     bool ok = m_worker.start(path, header, m_setup_info);
@@ -556,6 +707,9 @@ void DLSS5Live::_validate(bool for_real) {
         size_t new_hash = computeSettingsHash();
         if (new_hash != m_last_hash) {
             m_last_hash = new_hash;
+            // A rebuild drops the temporal history, so the latched white point
+            // has to go with it.
+            m_seq_white_point = 0.0f;
             rebuildWorker();
         }
     }
@@ -671,97 +825,123 @@ bool DLSS5Live::computeFrameCache() {
     int out_w = m_out_w, out_h = m_out_h;
     if (in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0) return false;
 
-    // Input contract: preserve Nuke's upstream numeric values as linear RGBA16F.
-    // HDR Range Scale optionally compresses RGB around Feature 18 and restores it on output.
+    // Reset logic:
+    // In Single Frame mode: force reset every frame for independent evaluation
+    // In Sequence / CG Multi-pass mode: sequential forward playback retains temporal history
+    //
+    // Decided up front because the latched white point below has to be dropped
+    // on the same frame the temporal history is dropped.
+    const int current_frame = (int)outputContext().frame();
+    bool reset = true;
+    if (k_pipeline_mode == MODE_SEQUENCE || k_pipeline_mode == MODE_CG) {
+        reset = !(m_frame_index != 0 && current_frame == (int)m_frame_index + 1);
+    }
+    if (reset) m_seq_white_point = 0.0f;
+
+    // ---- Colour management --------------------------------------------------
+    //
+    // The neural pass runs on whatever we hand it, so the whole colour question
+    // is decided here. Pixels are taken from Nuke's working space into the
+    // model's space, encoded, sent out, and the exact inverse is applied to what
+    // comes back (see the bottom of this function and src/AcesColor.h).
     const bool legacy_rgba8 = k_image_transport == 1;
     const int target_rw = (m_setup_info.render_width > 0) ? (int)m_setup_info.render_width : in_w;
     const int target_rh = (m_setup_info.render_height > 0) ? (int)m_setup_info.render_height : in_h;
 
-    std::vector<uint8_t> payload_in_8;
+    aces::Transform xf(buildColorParams());
+    const bool color_managed = xf.enabled();
+
+    // Legacy HDR Range Scale: only when colour management is off, so the two
+    // never compound. Upstream applied it on the 16-bit path only.
+    const float legacy_scale = (!color_managed && !legacy_rgba8 && k_enable_hdr_range)
+                             ? std::max(k_hdr_range_scale, 1.0f) : 1.0f;
+
+    // Pass 1: pull the frame into model-space scene-linear floats.
+    //
+    // This is a full-frame buffer rather than a row-at-a-time conversion because
+    // the auto white point has to see the whole frame before anything can be
+    // encoded.
+    std::vector<float> scene((size_t)in_w * in_h * 4);
+    float frame_max = 0.0f;
+    const bool want_auto_white = color_managed && k_aces_auto_white && xf.usesWhitePoint();
+
+    for (int ry = 0; ry < in_h; ry++) {
+        Row row(0, in_w);
+        row.get(input0(), ry, 0, in_w, Mask_RGBA);
+        const float* rp = row[Chan_Red];
+        const float* gp = row[Chan_Green];
+        const float* bp = row[Chan_Blue];
+        const float* ap = row[Chan_Alpha];
+
+        const int dy = in_h - 1 - ry;   // Nuke is bottom-up, the worker is top-down
+        for (int px = 0; px < in_w; px++) {
+            float r = rp ? rp[px] : 0.0f;
+            float g = gp ? gp[px] : 0.0f;
+            float b = bp ? bp[px] : 0.0f;
+
+            xf.toModel(r, g, b);
+            if (want_auto_white) frame_max = std::max(frame_max, std::max(r, std::max(g, b)));
+
+            const size_t idx = ((size_t)dy * in_w + px) * 4;
+            scene[idx + 0] = r;
+            scene[idx + 1] = g;
+            scene[idx + 2] = b;
+            // Alpha is never colour managed. It is coverage, not light.
+            scene[idx + 3] = ap ? ap[px] : 1.0f;
+        }
+    }
+
+    if (want_auto_white) {
+        const bool temporal = (k_pipeline_mode != MODE_SINGLE_FRAME);
+        // Latch the white point for the length of a temporal run. A white point
+        // that moves frame to frame is an exposure change as far as the model is
+        // concerned, and it shows up as flicker in the accumulated history.
+        if (temporal && m_seq_white_point > 0.0f) {
+            xf.setWhitePoint(m_seq_white_point);
+        } else {
+            const float w = std::max(frame_max, 1.0f);
+            xf.setWhitePoint(w);
+            if (temporal) m_seq_white_point = w;
+        }
+    }
+
+    // Pass 2: encode and pack for the transport, resampling if the worker
+    // negotiated a different render resolution.
+    std::vector<uint8_t>  payload_in_8;
     std::vector<uint16_t> payload_in_16;
 
-    if (legacy_rgba8) {
-        // Direct uint8 packing (Legacy Compatibility path)
-        std::vector<uint8_t> raw_in((size_t)in_w * in_h * 4, 0);
-        for (int ry = 0; ry < in_h; ry++) {
-            Row row(0, in_w);
-            row.get(input0(), ry, 0, in_w, Mask_RGBA);
-            const float* rp = row[Chan_Red];
-            const float* gp = row[Chan_Green];
-            const float* bp = row[Chan_Blue];
-            const float* ap = row[Chan_Alpha];
+    if (legacy_rgba8) payload_in_8.resize((size_t)target_rw * target_rh * 4, 0);
+    else              payload_in_16.resize((size_t)target_rw * target_rh * 4, 0);
 
-            int dy = in_h - 1 - ry;
-            for (int px = 0; px < in_w; px++) {
-                size_t idx = ((size_t)dy * in_w + px) * 4;
-                auto cvt = [](const float* p, int i, uint8_t def) -> uint8_t {
-                    if (!p) return def;
-                    return (uint8_t)std::clamp((int)(p[i] * 255.0f + 0.5f), 0, 255);
+    const bool resample = (target_rw != in_w || target_rh != in_h);
+
+    for (int y = 0; y < target_rh; y++) {
+        const int src_y = resample ? std::clamp((y * in_h) / target_rh, 0, in_h - 1) : y;
+        for (int x = 0; x < target_rw; x++) {
+            const int src_x = resample ? std::clamp((x * in_w) / target_rw, 0, in_w - 1) : x;
+            const size_t src_idx = ((size_t)src_y * in_w + src_x) * 4;
+            const size_t dst_idx = ((size_t)y * target_rw + x) * 4;
+
+            float r = scene[src_idx + 0];
+            float g = scene[src_idx + 1];
+            float b = scene[src_idx + 2];
+            const float a = scene[src_idx + 3];
+
+            xf.encodeFromModel(r, g, b);
+
+            if (legacy_rgba8) {
+                auto q = [](float v) -> uint8_t {
+                    return (uint8_t)std::clamp((int)(v * 255.0f + 0.5f), 0, 255);
                 };
-                raw_in[idx + 0] = cvt(rp, px, 0);
-                raw_in[idx + 1] = cvt(gp, px, 0);
-                raw_in[idx + 2] = cvt(bp, px, 0);
-                raw_in[idx + 3] = cvt(ap, px, 255);
-            }
-        }
-
-        if (target_rw == in_w && target_rh == in_h) {
-            payload_in_8 = std::move(raw_in);
-        } else {
-            payload_in_8.resize((size_t)target_rw * target_rh * 4, 0);
-            for (int y = 0; y < target_rh; y++) {
-                int src_y = std::clamp((y * in_h) / target_rh, 0, in_h - 1);
-                for (int x = 0; x < target_rw; x++) {
-                    int src_x = std::clamp((x * in_w) / target_rw, 0, in_w - 1);
-                    size_t src_idx = ((size_t)src_y * in_w + src_x) * 4;
-                    size_t dst_idx = ((size_t)y * target_rw + x) * 4;
-                    payload_in_8[dst_idx + 0] = raw_in[src_idx + 0];
-                    payload_in_8[dst_idx + 1] = raw_in[src_idx + 1];
-                    payload_in_8[dst_idx + 2] = raw_in[src_idx + 2];
-                    payload_in_8[dst_idx + 3] = raw_in[src_idx + 3];
-                }
-            }
-        }
-    } else {
-        // Direct half-float packing (Linear RGBA16F path)
-        const float hdr_range_scale = k_enable_hdr_range ? std::max(k_hdr_range_scale, 1.0f) : 1.0f;
-        std::vector<uint16_t> raw_in((size_t)in_w * in_h * 4, 0);
-        for (int ry = 0; ry < in_h; ry++) {
-            Row row(0, in_w);
-            row.get(input0(), ry, 0, in_w, Mask_RGBA);
-            const float* rp = row[Chan_Red];
-            const float* gp = row[Chan_Green];
-            const float* bp = row[Chan_Blue];
-            const float* ap = row[Chan_Alpha];
-
-            int dy = in_h - 1 - ry;
-            for (int px = 0; px < in_w; px++) {
-                size_t idx = ((size_t)dy * in_w + px) * 4;
-                auto cvt_rgb = [hdr_range_scale](const float* p, int i) -> uint16_t {
-                    return floatToHalf((p ? p[i] : 0.0f) / hdr_range_scale);
-                };
-                raw_in[idx + 0] = cvt_rgb(rp, px);
-                raw_in[idx + 1] = cvt_rgb(gp, px);
-                raw_in[idx + 2] = cvt_rgb(bp, px);
-                raw_in[idx + 3] = floatToHalf(ap ? ap[px] : 1.0f);
-            }
-        }
-
-        if (target_rw == in_w && target_rh == in_h) {
-            payload_in_16 = std::move(raw_in);
-        } else {
-            payload_in_16.resize((size_t)target_rw * target_rh * 4, 0);
-            for (int y = 0; y < target_rh; y++) {
-                int src_y = std::clamp((y * in_h) / target_rh, 0, in_h - 1);
-                for (int x = 0; x < target_rw; x++) {
-                    int src_x = std::clamp((x * in_w) / target_rw, 0, in_w - 1);
-                    size_t src_idx = ((size_t)src_y * in_w + src_x) * 4;
-                    size_t dst_idx = ((size_t)y * target_rw + x) * 4;
-                    payload_in_16[dst_idx + 0] = raw_in[src_idx + 0];
-                    payload_in_16[dst_idx + 1] = raw_in[src_idx + 1];
-                    payload_in_16[dst_idx + 2] = raw_in[src_idx + 2];
-                    payload_in_16[dst_idx + 3] = raw_in[src_idx + 3];
-                }
+                payload_in_8[dst_idx + 0] = q(r);
+                payload_in_8[dst_idx + 1] = q(g);
+                payload_in_8[dst_idx + 2] = q(b);
+                payload_in_8[dst_idx + 3] = q(a);
+            } else {
+                payload_in_16[dst_idx + 0] = floatToHalf(r / legacy_scale);
+                payload_in_16[dst_idx + 1] = floatToHalf(g / legacy_scale);
+                payload_in_16[dst_idx + 2] = floatToHalf(b / legacy_scale);
+                payload_in_16[dst_idx + 3] = floatToHalf(a);
             }
         }
     }
@@ -883,21 +1063,6 @@ bool DLSS5Live::computeFrameCache() {
     pack_scalar_guide(2, true, depth_payload);
     pack_scalar_guide(3, false, control_mask_payload);
 
-    // Reset logic:
-    // In Single Frame mode: force reset every frame for independent evaluation
-    // In Sequence / CG Multi-pass mode: sequential forward playback retains temporal history
-    int current_frame = (int)outputContext().frame();
-    bool reset = true;
-
-    if (k_pipeline_mode == MODE_SEQUENCE || k_pipeline_mode == MODE_CG) {
-        if (m_frame_index != 0 && current_frame == (int)m_frame_index + 1) {
-            reset = false;
-        } else {
-            reset = true;
-        }
-    } else {
-        reset = true;
-    }
     m_frame_index = (uint32_t)current_frame;
 
     // Send to DLSS worker
@@ -941,9 +1106,13 @@ bool DLSS5Live::computeFrameCache() {
                             : std::clamp((x * worker_out_w) / out_w, 0, worker_out_w - 1);
                 size_t src_idx = ((size_t)src_y * worker_out_w + src_x) * 4;
                 size_t dst_idx = ((size_t)y * out_w + x) * 4;
-                m_cache_rgba[dst_idx + 0] = out_rgba[src_idx + 0] / 255.0f;
-                m_cache_rgba[dst_idx + 1] = out_rgba[src_idx + 1] / 255.0f;
-                m_cache_rgba[dst_idx + 2] = out_rgba[src_idx + 2] / 255.0f;
+                float r = out_rgba[src_idx + 0] / 255.0f;
+                float g = out_rgba[src_idx + 1] / 255.0f;
+                float b = out_rgba[src_idx + 2] / 255.0f;
+                xf.inverse(r, g, b);
+                m_cache_rgba[dst_idx + 0] = r;
+                m_cache_rgba[dst_idx + 1] = g;
+                m_cache_rgba[dst_idx + 2] = b;
                 m_cache_rgba[dst_idx + 3] = out_rgba[src_idx + 3] / 255.0f;
             }
         }
@@ -960,19 +1129,18 @@ bool DLSS5Live::computeFrameCache() {
                             : std::clamp((x * worker_out_w) / out_w, 0, worker_out_w - 1);
                 size_t src_idx = ((size_t)src_y * worker_out_w + src_x) * 4;
                 size_t dst_idx = ((size_t)y * out_w + x) * 4;
-                m_cache_rgba[dst_idx + 0] = HalfToFloat(out16[src_idx + 0]);
-                m_cache_rgba[dst_idx + 1] = HalfToFloat(out16[src_idx + 1]);
-                m_cache_rgba[dst_idx + 2] = HalfToFloat(out16[src_idx + 2]);
+                // Undo, in order: the legacy range scale, the encoding the model
+                // was shown, and the trip into the model's colour space. The
+                // transform still carries this frame's white point, so the
+                // inverse matches the forward pass exactly.
+                float r = HalfToFloat(out16[src_idx + 0]) * legacy_scale;
+                float g = HalfToFloat(out16[src_idx + 1]) * legacy_scale;
+                float b = HalfToFloat(out16[src_idx + 2]) * legacy_scale;
+                xf.inverse(r, g, b);
+                m_cache_rgba[dst_idx + 0] = r;
+                m_cache_rgba[dst_idx + 1] = g;
+                m_cache_rgba[dst_idx + 2] = b;
                 m_cache_rgba[dst_idx + 3] = HalfToFloat(out16[src_idx + 3]);
-            }
-        }
-
-        const float hdr_range_scale = k_enable_hdr_range ? std::max(k_hdr_range_scale, 1.0f) : 1.0f;
-        if (hdr_range_scale != 1.0f) {
-            for (size_t i = 0; i < m_cache_rgba.size(); i += 4) {
-                m_cache_rgba[i + 0] *= hdr_range_scale;
-                m_cache_rgba[i + 1] *= hdr_range_scale;
-                m_cache_rgba[i + 2] *= hdr_range_scale;
             }
         }
     }

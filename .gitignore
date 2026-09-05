@@ -62,8 +62,12 @@ test_render_*.exr
 !install/*.png
 !install/**/*.png
 
-# Local test scripts (retained locally for CLI verification, untracked in Git)
-/tests/
+# tests/ is tracked in this fork: the ACES colour pipeline ships with a
+# standalone round-trip verification that needs no Nuke NDK, no GPU and no
+# NVIDIA runtime, so anyone can re-run it. Scratch files inside it are not.
+/tests/scratch/
+/tests/*.exe
+/tests/*.obj
 
 # Internal Studio Scripts (Contains private UNC paths / hosts)
 tools/*publish*

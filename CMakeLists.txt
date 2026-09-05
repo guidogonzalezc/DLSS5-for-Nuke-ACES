@@ -24,6 +24,7 @@ add_library(DLSS5Live SHARED
     src/DLSS5Live.h
     src/WorkerBridge.cpp
     src/WorkerBridge.h
+    src/AcesColor.h
 )
 
 set_target_properties(DLSS5Live PROPERTIES PREFIX "")

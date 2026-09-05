@@ -53,6 +53,20 @@ jobs:
       - name: Compile Python syntax only
         run: python -m compileall -q install
 
+  color-pipeline:
+    name: ACES colour pipeline
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Verify colour round trip, wire format and node compile
+        shell: pwsh
+        run: powershell.exe -ExecutionPolicy Bypass -File tests/run_tests.ps1
+
   secret-scan:
     name: Secret scan
     runs-on: ubuntu-latest

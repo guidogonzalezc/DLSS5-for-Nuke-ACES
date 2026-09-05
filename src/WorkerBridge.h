@@ -31,8 +31,18 @@ struct VideoHeader {
     uint32_t dis_preset = 1;          // 0=Fast, 1=Balanced, 2=High, 3=Extreme, 4=Custom
     uint32_t dis_flow_width = 640;    // e.g. 480, 640, 960, 1280
     uint32_t dis_iterations = 25;     // e.g. 12, 25, 32, 48
-    uint32_t _reserved_scene_cut = 0; // Unused (scene cut removed)
+    // Repurposed from the unused scene-cut reserve. Same offset and width, so a
+    // header written by this build is still understood by an older worker (it
+    // simply ignores the field) and vice versa.
+    uint32_t color_flags  = 0;        // see ColorFlags
     float    _reserved_thresh    = 0.0f;
+};
+
+enum ColorFlags : uint32_t {
+    // The plug-in already encoded the image to a display-referred signal
+    // (Rec.709 primaries + a display transfer function), so the NGX IsHDR
+    // feature flag must not be set for the super-resolution pass.
+    COLOR_DISPLAY_REFERRED = 1u << 0
 };
 
 struct SetupResponse {

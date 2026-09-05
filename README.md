@@ -1,10 +1,62 @@
-# DLSS 5 for Foundry Nuke
+# DLSS 5 for Foundry Nuke - ACES fork
+
+> **This is a fork of [KJzzzKJ/DLSS5-for-Nuke](https://github.com/KJzzzKJ/DLSS5-for-Nuke).**
+>
+> It adds an invertible ACES colour pipeline so the node can be used inside an
+> ACES comp without shifting colour. Everything else is upstream's work.
+> See **[docs/ACES.md](docs/ACES.md)** for the detail, or
+> [What the fork changes](#what-the-fork-changes) for the short version.
+
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Experimental-F59E0B.svg)](https://github.com/KJzzzKJ/DLSS5-for-Nuke/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(x64)-0078D6.svg)](https://www.microsoft.com/windows)
 [![Nuke Versions](https://img.shields.io/badge/Nuke-15.0%20%7C%2017.0-F9A01B.svg)](https://www.foundry.com/products/nuke)
 [![Hardware](https://img.shields.io/badge/GPU-NVIDIA%20RTX-76B900.svg)](https://www.nvidia.com)
+
+## What the fork changes
+
+Upstream hands Nuke's pixels to the neural model unchanged. The DLSS models are
+trained on display-referred Rec.709/sRGB frames in a nominal `0-1` range, and
+Nuke's ACES working space is scene-linear with AP1 primaries and no upper bound,
+so four mismatches land at once: wrong primaries, wrong transfer function, values
+far past `1.0`, and negative components on saturated colour. Hue drifts, skin
+desaturates, and highlights come back flat.
+
+This fork wraps the neural pass in a colour transform and its exact inverse:
+
+```
+ACEScg -> exposure -> Rec.709 primaries -> gamut compress
+       -> highlight roll-off -> sRGB curve -> [ DLSS ] -> inverse of all of it
+```
+
+Every stage has a closed-form inverse, so with the neural pass bypassed the round
+trip is the identity. The node can only change the picture by as much as DLSS
+changed it; the colour management contributes nothing of its own. That is checked
+numerically on every commit, over a spread of real ACES values and every
+combination of knobs:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File tests/run_tests.ps1
+```
+
+No Nuke NDK, GPU or NVIDIA runtime needed to run it.
+
+Summary of the changes:
+
+- `src/AcesColor.h` - new, dependency-free colour pipeline (primaries matrices
+  derived from chromaticities, ACES reference gamut compression, invertible
+  highlight roll-off, sRGB / Rec.709 / gamma 2.2 / ACEScct transfer functions).
+- `src/DLSS5Live.cpp` - an **ACES Color Management** knob group, and a rewritten
+  pixel path that converts on the way in and inverts on the way out.
+- `worker/DLSSWorker.cpp` - clears the NGX `IsHDR` flag when the node has already
+  encoded to a display-referred signal. Wire-compatible with an upstream worker,
+  so rebuilding it is optional.
+- `tests/` - round-trip verification, a wire-format guard, and a compile check
+  for the node against a mock DDImage.
+
+Colour management is **on by default**. Set **Enable Color Management** off to get
+upstream behaviour back, bit for bit.
 
 Experimental, unofficial native plug-in for using DLSS Neural Rendering in
 Foundry Nuke. `DLSS5Live` supports still images and temporal sequences through
@@ -152,19 +204,48 @@ When **External Input 1** is active:
   The default `-1.0` automatically inherits the value of **Local Structure**. Values from `0.0` to `2.0`
   override and independently adjust skin fidelity.
 
+### ACES Color Management
+
+Full reference: **[docs/ACES.md](docs/ACES.md)**.
+
+- **Enable Color Management** (default on): wrap the neural pass in the
+  invertible transform. Off reproduces upstream behaviour exactly.
+- **Working Space**: the colour space arriving at input 0. Must match your Nuke
+  working space - `ACEScg` with a standard OCIO ACES config. Also supports
+  ACES2065-1 (AP0), ACEScct, ACEScc, Linear Rec.709/sRGB and Linear P3-D65.
+- **DLSS Encoding**: what the model is shown. `sRGB Display (Rec.709)` is the
+  default and gives the best reconstruction. `ACEScct Log (AP1)` trades a little
+  reconstruction quality for flat precision across the range - use it for fire,
+  explosions and practicals above ~30.
+- **Highlight Roll-off**: `Extended Reinhard` (default, invertible for any
+  value), `ACES Filmic (Narkowicz)` for more mid contrast, or `None`.
+- **Pre-Exposure**: stops applied before the neural pass and removed after it.
+  Never reaches the output; use it to place a dark plate where the model works.
+- **Auto White Point** (default on) / **White Point**: the scene-linear value
+  that maps to `1.0` for the model. Auto tracks the frame maximum, and latches it
+  for the length of a temporal run so the model does not see exposure flicker.
+- **Gamut Compress** (default on): ACES reference gamut compression, undone
+  afterwards, so saturated AP1 colour does not reach the model as negatives.
+
+Highlight precision is the one real trade-off: a display encoding packs
+everything above the white point into the last sliver of the `0-1` range, so
+round-trip error grows with the white point (~0.8% of pixel magnitude at `16`,
+~4% at `128`, ~0.4% with the ACEScct encoding). The test suite prints these
+figures on every run.
+
 ### Color & Dynamic Range
 
 - **Color Bit Depth**:
   - `16-bit Half Float (Scene-Linear, Recommended)` (Default): Preserves full scene-linear
     dynamic range through the IPC transport.
   - `8-bit Integer (SDR Legacy)`: Legacy compatibility path where RGB is clamped to `0-1`
-    and quantized to 8-bit in both directions.
-- **Enable HDR Range**: Checkbox to activate highlight dynamic range compression.
-- **HDR Range Scale** (`1.0` - `64.0`, default `2.0`):
-  When enabled, divides RGB by this ratio before DLSS-NR (Feature 18) and restores (multiplies)
-  it afterward. For example, `2.0` maps an input value of `2.0` to `1.0` for the neural model
-  and restores it to `2.0` upon return. This protects bright lights, sun, and fire highlights
-  from neural clamping. Alpha, motion vectors, depth, and mask guides are not scaled.
+    and quantized to 8-bit in both directions. With colour management on, this now carries a
+    display-encoded signal, which is what 8-bit is actually suited to.
+- **Enable HDR Range** / **HDR Range Scale**: the upstream stopgap for the same
+  problem the colour pipeline now solves properly, so these only appear when
+  **Enable Color Management** is off. When enabled, RGB is divided by the ratio
+  before DLSS-NR (Feature 18) and multiplied back afterward. Alpha, motion
+  vectors, depth and mask guides are not scaled.
 
 ### Scanline Layout Alignment
 
@@ -185,6 +266,17 @@ publicly approved files for a Release.
 powershell.exe -ExecutionPolicy Bypass -File tools/build_multi.ps1
 powershell.exe -ExecutionPolicy Bypass -File worker/build.ps1
 ```
+
+The colour pipeline can be verified without any of that:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File tests/run_tests.ps1
+```
+
+It needs only MSVC - no Nuke NDK, no GPU, no NVIDIA runtime - and checks that the
+colour round trip is the identity, that the two copies of `VideoHeader` still
+agree, and that `src/DLSS5Live.cpp` still compiles.
+
 
 ### Build for an unlisted Nuke version
 
@@ -217,7 +309,7 @@ runtimes automatically.
 
 ## License and disclaimer
 
-Project-authored source is licensed under [MIT](LICENSE). NVIDIA, DLSS, NGX,
+Project-authored source is licensed under [MIT](LICENSE), which this fork keeps unchanged; the upstream project and its authors retain credit for everything outside the colour pipeline. NVIDIA, DLSS, NGX,
 Foundry, and Nuke are trademarks or registered trademarks of their respective
 owners. This project does not claim ownership of their SDKs, runtimes, or
 trademarks.

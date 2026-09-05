@@ -426,7 +426,13 @@ bool DLSSWorker::initNGX(const VideoHeader& hdr) {
         m_srParams->Set("OutWidth", m_outW);
         m_srParams->Set("OutHeight", m_outH);
         m_srParams->Set("PerfQualityValue", (int)m_hdr.perf_quality);
-        m_srParams->Set("DLSS.Feature.Create.Flags", (unsigned int)(1 | 8)); // IsHDR (1) | DepthInverted (8)
+        // IsHDR tells DLSS-SR the colour buffer is scene-referred with values
+        // beyond 1.0. When the Nuke node has already encoded the image to a
+        // display-referred signal, that is no longer true and the flag has to
+        // come off, or SR re-applies its own range assumptions on top.
+        unsigned int srFlags = 8u; // DepthInverted
+        if ((m_hdr.color_flags & COLOR_DISPLAY_REFERRED) == 0) srFlags |= 1u; // IsHDR
+        m_srParams->Set("DLSS.Feature.Create.Flags", srFlags);
         m_srParams->Set("DLSS.Hint.Render.Preset", (int)m_hdr.dlss_model_preset);
 
         NGXResult srCr = shimCreate(reinterpret_cast<void*>(coreCreate), m_cmdList.Get(), 1, m_srParams, &m_srFeature);

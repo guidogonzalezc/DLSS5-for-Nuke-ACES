@@ -7,6 +7,7 @@
 #include "DDImage/Format.h"
 #include "DDImage/ChannelSet.h"
 #include "WorkerBridge.h"
+#include "AcesColor.h"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -58,6 +59,7 @@ public:
 
 private:
     float getScaleFactor() const;
+    aces::Params buildColorParams() const;
     uint32_t getPerfQuality() const;
     uint32_t getModelPreset() const;
     size_t computeSettingsHash() const;
@@ -93,6 +95,21 @@ private:
     bool k_enable_hdr_range;
     float k_hdr_range_scale;
     const char* k_nvngx_path;
+
+    // ACES colour management (see src/AcesColor.h)
+    bool  k_aces_enabled;
+    int   k_aces_working_space;
+    int   k_aces_encoding;
+    int   k_aces_tonemap;
+    float k_aces_exposure;
+    bool  k_aces_auto_white;
+    float k_aces_white_point;
+    bool  k_aces_gamut_compress;
+
+    // White point latched at the start of a temporal run. Recomputing it every
+    // frame would make the model see a different exposure each time, which
+    // reads as flicker in the accumulated history.
+    float m_seq_white_point = 0.0f;
 
     WorkerBridge m_worker;
     SetupResponse m_setup_info;
