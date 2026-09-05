@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(DLSS5Live VERSION 1.0.0 LANGUAGES CXX)
+project(DLSS5Live VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -36,7 +36,8 @@ target_include_directories(DLSS5Live PRIVATE
 )
 
 target_compile_definitions(DLSS5Live PRIVATE
-    DLSS5_VERSION_STRING="v${PROJECT_VERSION}"
+    # The suffix makes the ACES fork identifiable in the node header.
+    DLSS5_VERSION_STRING="v${PROJECT_VERSION}-aces"
     WIN32
     _WINDOWS
     NOMINMAX
@@ -45,7 +46,9 @@ target_compile_definitions(DLSS5Live PRIVATE
     _CRT_NONSTDC_NO_WARNINGS
     NDEBUG
     _USRDLL
-    _EXPORT=__declspec(dllexport)
+    # _EXPORT=__declspec(dllexport) used to live here. CMake splits a
+    # definition containing parentheses, so it arrived as two broken
+    # defines plus a warning on every build - and nothing referenced it.
 )
 
 target_link_directories(DLSS5Live PRIVATE "${NUKE_LIB_DIR}")
