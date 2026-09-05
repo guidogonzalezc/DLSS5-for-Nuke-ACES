@@ -1,0 +1,24 @@
+# Batch files MUST be checked out with CRLF, on every platform and regardless of
+# the user's core.autocrlf setting.
+#
+# cmd.exe tracks its position in a running .bat by byte offset. With LF-only
+# line endings it mis-seeks after returning from `call :label` and silently
+# skips the following line - no error, no output, the statement simply never
+# runs. It cost a debugging session here: the installer copied one file, skipped
+# the next, and the uninstaller then could not find its helper.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell is not affected the same way, but keeping it CRLF avoids surprises
+# in editors and in the release ZIP.
+*.ps1 text eol=crlf
+
+# Everything else: normalise in the repository, check out per platform.
+* text=auto
+
+# Binary assets must never be touched.
+*.png binary
+*.dll binary
+*.exe binary
+*.lib binary
+*.zip binary

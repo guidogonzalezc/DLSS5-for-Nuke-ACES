@@ -102,6 +102,7 @@ if (-not $workerOk -and -not $AllowMissingWorker) {
 # ---- installer and docs ----------------------------------------------------
 $flat = @{
     "install\install.bat"             = "install.bat"
+    "install\DLSS5Live-uninstall.bat" = "DLSS5Live-uninstall.bat"
     "install\register_plugin_path.ps1" = "register_plugin_path.ps1"
     "install\init.py"                 = "init.py"
     "install\menu.py"                 = "menu.py"
@@ -138,6 +139,30 @@ if ($leaked) {
     exit 1
 }
 Write-Host "    [+] runtime policy check passed (no third-party binaries)" -ForegroundColor Green
+
+# ---- line-ending check -----------------------------------------------------
+# cmd.exe tracks its position in a running .bat by byte offset. With LF-only
+# line endings it mis-seeks after returning from `call :label` and silently
+# skips the next line: no error, no output, the statement just never runs.
+# A .gitattributes keeps the repository right; this catches a package assembled
+# from a working tree that predates it.
+$badEol = @()
+foreach ($f in Get-ChildItem $OutputDir -Recurse -File -Include "*.bat", "*.cmd") {
+    $text = [System.IO.File]::ReadAllText($f.FullName)
+    if ($text -match "(?<!`r)`n") { $badEol += $f.FullName }
+}
+if ($badEol) {
+    Write-Host ""
+    foreach ($f in $badEol) { Write-Warning "LF line endings in $f" }
+    Write-Error @"
+Batch files in the package must use CRLF.
+
+Fix the working tree and re-run:
+    git add --renormalize .
+"@
+    exit 1
+}
+Write-Host "    [+] batch files use CRLF" -ForegroundColor Green
 
 Write-Host "`n[SUCCESS] Package assembled: $OutputDir" -ForegroundColor Green
 Write-Host "          Nuke versions: $($majors -join ', ')" -ForegroundColor Gray

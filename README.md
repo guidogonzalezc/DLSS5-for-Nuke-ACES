@@ -58,6 +58,8 @@ Summary of the changes:
   and so it removes any previous install (upstream's included) without touching
   the NVIDIA runtime you supplied.
 - `tools/build_and_install.bat` - one-step build and install from source.
+- `installer/setup_stub.cpp` + `tools/make_installer_exe.ps1` - the one-click
+  `Setup.exe`, so a user needs nothing but the download.
 
 Colour management is **on by default**. Set **Enable Color Management** off to get
 upstream behaviour back, bit for bit.
@@ -104,18 +106,32 @@ DLL built for Nuke 15.0 is automatically compatible with Nuke 15.1 or 15.2.
 
 ## Installation
 
-Two paths. Pick the first unless you are changing the code.
+Three paths. Pick the first unless you are changing the code.
 
-### A. From a Release ZIP — no compiler needed
+### A. One-click installer — download and run
 
-1. Download the Release ZIP and extract it.
-2. Run `install.bat`.
+1. Download `DLSS5-for-Nuke-ACES-<version>-Setup.exe` from the Releases page.
+2. Run it.
 3. Restart Nuke, press **Tab**, create `DLSS5Live`.
 
-No Visual Studio, no CMake, no Nuke NDK — it only copies prebuilt files.
+That is all. No ZIP to extract, no Visual Studio, no CMake, no Nuke NDK, and no
+Visual C++ redistributable — the installer is a single self-contained
+executable that unpacks itself and does the work.
 
-`install.bat` removes any previous installation before installing, including one
-made by upstream's installer:
+It is unsigned, so a freshly downloaded copy trips SmartScreen: **More info →
+Run anyway**.
+
+`Setup.exe /uninstall` and `Setup.exe /y` are passed straight through to the
+installer, and the install leaves a `DLSS5Live-uninstall.bat` beside the plug-in
+folder in `~/.nuke/`.
+
+### B. From a Release ZIP
+
+Same thing, if you would rather see the files first: extract the ZIP and run
+`install.bat`. Identical behaviour and the same options.
+
+Either way, the installer removes any previous installation before installing,
+including one made by upstream's installer:
 
 - old `DLSS5Live.dll` files, for every Nuke version, so no stale build can be
   loaded by accident;
@@ -136,7 +152,7 @@ removed.
 | `/uninstall` | Remove the plug-in and the `init.py` registration. |
 | `/y` | Do not wait for a keypress at the end. |
 
-### B. From source
+### C. From source
 
 Needs **Visual Studio 2022 or newer with "Desktop development with C++"** (CMake
 and Ninja come with its "C++ CMake tools for Windows" component) and at least one
@@ -193,18 +209,35 @@ To sanity-check colour: set **Upscaling Mode** to `1.0x (DLAA)` and `Merge
 difference only — no overall cast, no shift along a grey ramp. Toggling **Enable
 Color Management** shows the upstream behaviour for comparison.
 
-### Producing a Release ZIP (maintainers)
+### Producing a Release (maintainers)
 
-The ZIP that path A installs has to be built once, on a machine with Nuke:
+Everything users download is built once, on a machine with Nuke:
 
 ```powershell
 tools\build_and_install.bat /build-only
 powershell.exe -ExecutionPolicy Bypass -File tools\package_release.ps1 -CreateZip
+powershell.exe -ExecutionPolicy Bypass -File tools\make_installer_exe.ps1
 ```
 
 `package_release.ps1` collects every `bin\Nuke*` DLL that was built, the worker,
 the installer and the docs, stamps `VERSION.txt` to match the string compiled
-into the node header, and refuses to package third-party runtime binaries.
+into the node header, refuses to package third-party runtime binaries, and
+rejects batch files with LF line endings.
+
+`make_installer_exe.ps1` serialises that folder into `installer/setup_stub.cpp`
+as a resource and links it statically, producing the one-click `Setup.exe`.
+Building the installer needs MSVC; running it does not.
+
+> IExpress, which ships with Windows, was the obvious way to build the .exe.
+> Its `AppLaunched` step fails with `0x80070002` on current Windows builds even
+> for a minimal one-file package — the payload extracts and nothing ever runs —
+> so the stub replaces it. It is ~200 lines of Win32 with no dependencies.
+
+**Batch files must stay CRLF.** `cmd.exe` tracks its position in a running
+`.bat` by byte offset; with LF-only endings it mis-seeks after returning from
+`call :label` and silently skips the following line — no error, no output, the
+statement simply never runs. `.gitattributes` pins this, and
+`package_release.ps1` fails the build if it slips through.
 
 ## Runtime policy
 

@@ -126,6 +126,9 @@ call :remove_file "%PLUGIN_DIR%\DLSS5.png"
 call :remove_file "%PLUGIN_DIR%\README.md"
 call :remove_file "%PLUGIN_DIR%\ACES.md"
 call :remove_file "%PLUGIN_DIR%\VERSION.txt"
+call :remove_file "%PLUGIN_DIR%\uninstall.bat"
+call :remove_file "%PLUGIN_DIR%\install.bat"
+call :remove_file "%PLUGIN_DIR%\register_plugin_path.ps1"
 
 REM Only the two files this project owns. Everything else under runtime\ is the
 REM NVIDIA runtime the user supplied, and re-obtaining it is a nuisance, so it
@@ -161,6 +164,19 @@ if exist "%PKG%runtime\nvngx.dll" (
     copy /Y "%PKG%runtime\nvngx.dll" "%RUNTIME_TARGET%\nvngx.dll" >nul
     echo       Installed runtime\nvngx.dll ^(caller shim^)
 )
+
+REM Leave the uninstaller behind. Someone who installed from a one-click .exe
+REM has no extracted ZIP to go back to, so without this there is no way to
+REM remove the plug-in cleanly.
+REM
+REM The entry point goes one level up, beside the plug-in folder rather than
+REM inside it: an uninstaller that lives in the directory it deletes is pulled
+REM out from under cmd mid-run, and everything after the deletion silently stops
+REM happening.
+call :copy_if "%SCRIPT_DIR%install.bat" "%PLUGIN_DIR%\install.bat"
+call :copy_if "%REGISTER_PS1%"          "%PLUGIN_DIR%\register_plugin_path.ps1"
+call :copy_if "%PKG%DLSS5Live-uninstall.bat" "%NUKE_USER_DIR%\DLSS5Live-uninstall.bat"
+if exist "%NUKE_USER_DIR%\DLSS5Live-uninstall.bat" echo       Installed ..\DLSS5Live-uninstall.bat
 
 REM A stamp so the next run can report what it is replacing.
 >"%PLUGIN_DIR%\VERSION.txt" echo !PKG_VERSION!
@@ -362,6 +378,8 @@ echo.
 
 if exist "%PLUGIN_DIR%" (
     call :save_runtime_note
+    REM Never hold the directory open while deleting it.
+    cd /d "%TEMP%" >nul 2>&1
     rmdir /S /Q "%PLUGIN_DIR%" >nul 2>&1
     if exist "%PLUGIN_DIR%" (
         echo   [WARN] Could not fully remove %PLUGIN_DIR% - close Nuke and retry.
@@ -377,6 +395,17 @@ if exist "!REGISTER_PS1!" (
 ) else (
     echo   [!] register_plugin_path.ps1 not found; remove the DLSS5 block from
     echo       %INIT_FILE% by hand.
+)
+
+REM DLSS5Live-uninstall.bat is almost certainly the script that called us, and
+REM cmd reads the next line of a batch file after a `call` returns. Deleting it
+REM here kills the caller mid-run with "The batch file cannot be found" - which
+REM is exactly how the init.py cleanup above got skipped once. Leave it and say
+REM so instead.
+if exist "%NUKE_USER_DIR%\DLSS5Live-uninstall.bat" (
+    echo.
+    echo   [*] You can now delete:
+    echo       %NUKE_USER_DIR%\DLSS5Live-uninstall.bat
 )
 
 if exist "%NUKE_USER_DIR%\runtime" (
